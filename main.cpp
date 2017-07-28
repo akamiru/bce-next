@@ -116,8 +116,8 @@ int encode_main (
 
     // load ranks
     auto r1_j  = _rank_get(rdict_base, c_j);
-    auto r1_i  = _mm512_load_si512(cache_iter + 2 * cache_step);
-    auto r1_k  = _mm512_load_si512(cache_iter + 4 * cache_step);
+    auto r1_i  = _mm512_load_si512(_addr(cache_iter, 2 * cache_step));
+    auto r1_k  = _mm512_load_si512(_addr(cache_iter, 4 * cache_step));
     cache_iter = _addr(cache_iter, vector_size);
 
     // calculate some butterflies vars
