@@ -3,25 +3,16 @@
 
 #include "/home/christoph/intel/iaca/include/iacaMarks.h"
 
-inline __m512i _interleavelo_epi32(__m512i a, __m512i b) {
-  auto c = _mm512_permutexvar_epi64(_mm512_set_epi64(7,3,6,2,5,1,4,0), a);
-  auto d = _mm512_permutexvar_epi64(_mm512_set_epi64(7,3,6,2,5,1,4,0), b);
-  return _mm512_unpacklo_epi32(c, d);
+inline void _interleavelo_compress_and_store(uint32_t* dst, __mmask16 k, __m512i a, __m512i b) {
+  auto shuffle_mask = _mm512_set_epi32(23, 7,22, 6,21, 5,20, 4,19, 3,18, 2,17, 1,16, 0);
+  shuffle_mask = _mm512_maskz_compress_epi32(k, shuffle_mask);
+  _mm512_storeu_si512(dst, _mm512_permutex2var_epi32(a, shuffle_mask, b));
 }
 
-inline __m512i _interleavehi_epi32(__m512i a, __m512i b) {
-  auto c = _mm512_permutexvar_epi64(_mm512_set_epi64(7,3,6,2,5,1,4,0), a);
-  auto d = _mm512_permutexvar_epi64(_mm512_set_epi64(7,3,6,2,5,1,4,0), b);
-  return _mm512_unpackhi_epi32(c, d);
-}
-
-inline __m512i _compress_mask(__mmask16 k) {
-  auto a = _mm512_set_epi32(15,14,13,12,11,10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0);
-  return _mm512_mask_compress_epi32(_mm512_undefined_epi32(), k, a);
-}
-
-inline void _mask_compressstoreu_epi32(uint32_t* dst, __m512i k, __m512i a) {
-  _mm512_storeu_si512(dst, _mm512_permutexvar_epi32(k, a));
+inline void _interleavehi_compress_and_store(uint32_t* dst, __mmask16 k, __m512i a, __m512i b) {
+  auto shuffle_mask = _mm512_set_epi32(31,15,30,14,29,13,28,12,27,11,26,10,25, 9,24, 8);
+  shuffle_mask = _mm512_maskz_compress_epi32(k, shuffle_mask);
+  _mm512_storeu_si512(dst, _mm512_permutex2var_epi32(a, shuffle_mask, b));
 }
 
 inline __m512i _rank_get(std::uint64_t* dict, __m512i indice) {
@@ -60,8 +51,7 @@ inline __m512i _rank_get(std::uint64_t* dict, __m512i indice) {
        bits  = _mm512_add_epi32(bitsl, bitsh);
 
   // uint32_t popcount
-  bits = _mm512_maskz_dbsad_epu8(0x55, bits, _mm512_setzero_si512(), 0);
-  //bits = _mm512_lzcnt_epi32(bits);
+  bits = _mm512_maskz_dbsad_epu8(0x5555, bits, _mm512_setzero_si512(), 0);
 #else
   bits = _mm512_popcnt_epi32(bits);
 #endif
@@ -69,48 +59,68 @@ inline __m512i _rank_get(std::uint64_t* dict, __m512i indice) {
   return _mm512_add_epi32(rank, bits);
 }
 
-int loop(uint32_t* stream, uint16_t* mask, uint32_t* out, uint32_t* coder_iter, std::size_t step, std::uint64_t* dict, std::uint32_t C0, uint32_t* queue_out0, uint32_t* queue_out1) {
-  __m512i pmask;
-  auto o = _mm512_set1_epi32(C0);
+inline std::uint32_t* _addr(std::uint32_t* base, std::size_t byte_step) {
+  return reinterpret_cast<std::uint32_t*>(
+    reinterpret_cast<std::uint8_t*>(base) + byte_step
+  );
+}
 
-  std::uint32_t* queue_iter = stream;
-  std::uint32_t* rank_iter  = stream + 0xdeadbeaf;
+int encode_main (
+  // The queues
+  //  current
+  std::uint32_t* queue_iter,  // start of the queue
+  std::uint32_t* queue_last,  // end   of the queue
+  // next (queue_out0 MAY BE queue_iter)
+  std::uint32_t* queue_out0,  // where to write out the queue (zero)
+  std::uint32_t* queue_out1,  // where to write out the queue (ones)
 
-  std::size_t queue_step = step;
-  std::size_t rank_step  = step + 0xdeadbeaf;
+  // cached values (should fit L1 or L2)
+  std::uint32_t* cache_iter,  // start of the cached values
+  std::uint32_t* cache_next,  // where to write the next cached values
+  std::size_t    cache_step,  // step between the cache columns
+                              // columns: c_i, c_k, r1_i, unused/coder, r1_k
+                              //   we dont use column 3 to save registers (addressing doesn't allow *3)
+                              //   L1/L2 shouldn't be effected by this
+                              //   unused memory overhead is not that big
+                              //   if we interleave all 8 caches we can use
+                              //   that one big free chunk for the coder ! 
 
-  for (int c_ = 0; c_ < 1024; ++c_) {
+  // the rank dictionary
+  std::uint64_t* rdict_base,  // base address of the dictionary
+  std::uint32_t  count_zero,  // number of zeros in this dictionary
+
+  // stream of the selection masks
+  std::uint16_t* smask_iter,
+  std::uint16_t* smask_out0,
+  std::uint16_t* smask_out1,
+
+  // where to store the coder information
+  std::uint32_t* coder_iter   // should use the free column in the cache
+) {
+  // constants
+  constexpr std::size_t vector_size = sizeof(__m512i);
+
+  // loop invariants
+  auto c_z = _mm512_set1_epi32(count_zero);  // broadcast the amountof zeros
+
+  // adjustments
+  cache_step *= sizeof(*queue_iter);  // adjust for _addr()
+  cache_step *= sizeof(*queue_iter);  // adjust for _addr()
+
+
+  while (queue_iter < queue_last) {
     IACA_START
     // load queue
-    __m512i c_j = _mm512_load_si512(queue_iter + 1 * queue_step);
-    __m512i c_i = _mm512_load_si512(queue_iter + 0 * queue_step);
-    __m512i c_k = _mm512_load_si512(queue_iter + 2 * queue_step);
-    queue_iter += 16;
+    auto c_j   = _mm512_load_si512(queue_iter);
+    auto c_i   = _mm512_load_si512(_addr(cache_iter, 0 * cache_step));
+    auto c_k   = _mm512_load_si512(_addr(cache_iter, 1 * cache_step));
+    queue_iter = _addr(queue_iter, vector_size);
 
     // load ranks
-    __m512i r1_j = _rank_get(dict, c_j);
-    __m512i r1_i = _mm512_load_si512(rank_iter + 0 * rank_step);
-    __m512i r1_k = _mm512_load_si512(rank_iter + 1 * rank_step);
-    rank_iter += 16;
-
-    // interleave loads and ranks
-    // write out only the used ones (lo part)
-    std::uint64_t mask_lo = *mask++;
-    pmask = _compress_mask(mask_lo);
-    _mask_compressstoreu_epi32(out + 0 * step, pmask, _interleavelo_epi32(c_i , c_j ));
-    _mask_compressstoreu_epi32(out + 1 * step, pmask, _interleavelo_epi32(c_j , c_k ));
-    _mask_compressstoreu_epi32(out + 2 * step, pmask, _interleavelo_epi32(r1_i, r1_j));
-    _mask_compressstoreu_epi32(out + 3 * step, pmask, _interleavelo_epi32(r1_j, r1_k));
-    out += _mm_popcnt_u64(mask_lo);
-
-    // write out only the used ones (hi part)
-    std::uint64_t mask_hi = *mask++;
-    pmask = _compress_mask(mask_hi);
-    _mask_compressstoreu_epi32(out + 0 * step, pmask, _interleavehi_epi32(c_i , c_j ));
-    _mask_compressstoreu_epi32(out + 1 * step, pmask, _interleavehi_epi32(c_j , c_k ));
-    _mask_compressstoreu_epi32(out + 2 * step, pmask, _interleavehi_epi32(r1_i, r1_j));
-    _mask_compressstoreu_epi32(out + 3 * step, pmask, _interleavehi_epi32(r1_j, r1_k));
-    out += _mm_popcnt_u64(mask_hi);
+    auto r1_j  = _rank_get(rdict_base, c_j);
+    auto r1_i  = _mm512_load_si512(cache_iter + 2 * cache_step);
+    auto r1_k  = _mm512_load_si512(cache_iter + 4 * cache_step);
+    cache_iter = _addr(cache_iter, vector_size);
 
     // calculate some butterflies vars
     auto n_1w_ = _mm512_sub_epi32(c_k, c_j);
@@ -125,20 +135,20 @@ int loop(uint32_t* stream, uint16_t* mask, uint32_t* out, uint32_t* coder_iter, 
     auto n__w0 = _mm512_sub_epi32(r0_k, r0_i);
     auto n_1w1 = _mm512_sub_epi32(r1_k, r1_j);
 
+    __mmask16 select_mask;
     // right out the queue (zero part)
-    // @todo store the mask
-    __mmask16 context_mask;
-    context_mask = _mm512_cmpgt_epi32_mask(r0_j, r0_i);
-    context_mask = _mm512_mask_cmpgt_epi32_mask(context_mask, r0_k, r0_j);
-    _mm512_mask_compressstoreu_epi32(queue_out0, context_mask, _mm512_add_epi32(r0_j, o));
-    queue_out0 += _mm_popcnt_u64(context_mask);
+    select_mask = _mm512_cmpgt_epi32_mask(r0_j, r0_i);
+    select_mask = _mm512_mask_cmpgt_epi32_mask(select_mask, r0_k, r0_j);
+    _mm512_mask_compressstoreu_epi32(queue_out0, select_mask, _mm512_add_epi32(r0_j, c_z));
+    queue_out0 += _mm_popcnt_u64(select_mask);
+    *smask_out0++ = select_mask;
 
     // right out the queue (ones part)
-    // @todo store the mask
-    context_mask = _mm512_cmpgt_epi32_mask(r1_j, r1_i);
-    context_mask = _mm512_mask_cmpgt_epi32_mask(context_mask, r1_k, r1_j);
-    _mm512_mask_compressstoreu_epi32(queue_out1, context_mask,  _mm512_add_epi32(r1_j, o));
-    queue_out0 += _mm_popcnt_u64(context_mask);
+    select_mask = _mm512_cmpgt_epi32_mask(r1_j, r1_i);
+    select_mask = _mm512_mask_cmpgt_epi32_mask(select_mask, r1_k, r1_j);
+    _mm512_mask_compressstoreu_epi32(queue_out1, select_mask,  _mm512_add_epi32(r1_j, c_z));
+    queue_out1 += _mm_popcnt_u64(select_mask);
+    *smask_out1++ = select_mask;
 
     // calculate the limits from the butterfly
     __m512i min = _mm512_maskz_sub_epi32(_mm512_cmpgt_epi32_mask(n_1w_, n__w0), n_1w_, n__w0);
@@ -149,9 +159,28 @@ int loop(uint32_t* stream, uint16_t* mask, uint32_t* out, uint32_t* coder_iter, 
     auto base  = _mm512_add_epi32(_mm512_sub_epi32(max, min), _mm512_set1_epi32(1));
 
     // store the limits for the coder
-    _mm512_storeu_si512(coder_iter +  0, digit);
-    _mm512_storeu_si512(coder_iter + 16, base );
-    coder_iter += 32;
+    _mm512_storeu_si512(_addr(coder_iter, 0 * vector_size), digit);
+    _mm512_storeu_si512(_addr(coder_iter, 1 * vector_size), base );
+    coder_iter = _addr(coder_iter, 2 * vector_size);
+
+    // interleave loads and ranks
+    // write out only the used ones (lo part)
+    auto mask_lo  = static_cast<std::uint16_t>(*smask_iter++);
+    //auto pmask_lo = _compress_mask(mask_lo);
+    _interleavelo_compress_and_store(_addr(cache_next, 0 * cache_step), mask_lo, c_i , c_j );
+    _interleavelo_compress_and_store(_addr(cache_next, 1 * cache_step), mask_lo, c_j , c_k );
+    _interleavelo_compress_and_store(_addr(cache_next, 2 * cache_step), mask_lo, r1_i, r1_j);
+    _interleavelo_compress_and_store(_addr(cache_next, 4 * cache_step), mask_lo, r1_j, r1_k);
+    cache_next += _mm_popcnt_u32(mask_lo);
+
+    // write out only the used ones (hi part)
+    auto mask_hi  = static_cast<std::uint16_t>(*smask_iter++);
+    //auto pmask_hi = _compress_mask(mask_hi);
+    _interleavehi_compress_and_store(_addr(cache_next, 0 * cache_step), mask_hi, c_i , c_j );
+    _interleavehi_compress_and_store(_addr(cache_next, 1 * cache_step), mask_hi, c_j , c_k );
+    _interleavehi_compress_and_store(_addr(cache_next, 2 * cache_step), mask_hi, r1_i, r1_j);
+    _interleavehi_compress_and_store(_addr(cache_next, 4 * cache_step), mask_hi, r1_j, r1_k);
+    cache_next += _mm_popcnt_u32(mask_hi);
   }
   IACA_END
   return 0;
