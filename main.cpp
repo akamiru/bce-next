@@ -105,8 +105,6 @@ int encode_main (
 
   // adjustments
   cache_step *= sizeof(*queue_iter);  // adjust for _addr()
-  cache_step *= sizeof(*queue_iter);  // adjust for _addr()
-
 
   while (queue_iter < queue_last) {
     IACA_START
