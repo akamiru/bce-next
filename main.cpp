@@ -3,32 +3,11 @@
 
 #include "/home/christoph/intel/iaca/include/iacaMarks.h"
 
-inline void _interleavelo_compress_and_store(uint32_t* dst, __mmask16 k, __m512i a, __m512i b) {
-  auto shuffle_mask = _mm512_set_epi32(23, 7,22, 6,21, 5,20, 4,19, 3,18, 2,17, 1,16, 0);
-  shuffle_mask = _mm512_maskz_compress_epi32(k, shuffle_mask);
-  _mm512_storeu_si512(dst, _mm512_permutex2var_epi32(a, shuffle_mask, b));
+inline void _permute_and_store(std::uint32_t* dst, __m512i k, __m512i a, __m512i b) {
+    _mm512_storeu_si512(dst, _mm512_permutex2var_epi32(a, k, b));
 }
 
-inline void _interleavehi_compress_and_store(uint32_t* dst, __mmask16 k, __m512i a, __m512i b) {
-  auto shuffle_mask = _mm512_set_epi32(31,15,30,14,29,13,28,12,27,11,26,10,25, 9,24, 8);
-  shuffle_mask = _mm512_maskz_compress_epi32(k, shuffle_mask);
-  _mm512_storeu_si512(dst, _mm512_permutex2var_epi32(a, shuffle_mask, b));
-}
-
-inline __m512i _rank_get(std::uint64_t* dict, __m512i indice) {
-  // calculate the offsets
-  auto offsets = _mm512_srli_epi32(indice, 5);
-
-  // IACA says faster on Broadwell
-  auto storage = reinterpret_cast<const int32_t*>(dict);
-#if 1
-  auto bits = _mm512_i32gather_epi32(offsets, storage + 0, 8);
-  auto rank = _mm512_i32gather_epi32(offsets, storage + 1, 8);
-#else
-  auto bits = _mm512_load_si512(storage + 0);
-  auto rank = _mm512_load_si512(storage + 1);
-#endif
-
+inline __m512i _rank_get(__m512i bits, __m512i rank, __m512i indice) {
   // we store (bits+bits) to save a cycle (we never count the highest bit)
   indice = _mm512_andnot_si512(indice, _mm512_set1_epi32(0x1F));
   bits   = _mm512_srlv_epi32  (bits  , indice);
@@ -74,59 +53,85 @@ int encode_main (
   std::uint32_t* queue_out0,  // where to write out the queue (zero)
   std::uint32_t* queue_out1,  // where to write out the queue (ones)
 
-  // cached values (should fit L1 or L2)
+  // cached values (should probably fit L1 or L2)
   std::uint32_t* cache_iter,  // start of the cached values
   std::uint32_t* cache_next,  // where to write the next cached values
-  std::size_t    cache_step,  // step between the cache columns
+  std::size_t    cache_step,  // step between the cache columns in BYTES
                               // columns: c_i, c_k, r1_i, unused/coder, r1_k
                               //   we dont use column 3 to save registers (addressing doesn't allow *3)
                               //   L1/L2 shouldn't be effected by this
                               //   unused memory overhead is not that big
                               //   if we interleave all 8 caches we can use
-                              //   that one big free chunk for the coder ! 
+                              //   that one big free chunk for the coder !
 
   // the rank dictionary
-  std::uint64_t* rdict_base,  // base address of the dictionary
+  std::uint32_t* rdict_base,  // base address of the dictionary
   std::uint32_t  count_zero,  // number of zeros in this dictionary
 
-  // stream of the selection masks
-  std::uint16_t* smask_iter,
-  std::uint16_t* smask_out0,
-  std::uint16_t* smask_out1,
+  // stream of the filter masks
+  std::uint16_t* fmask_iter,
+  std::uint16_t* fmask_out0,
+  std::uint16_t* fmask_out1,
 
   // where to store the coder information
-  std::uint32_t* coder_iter   // should use the free column in the cache
+  std::uint32_t* coder_iter,  // should use the free column in the cache
+  __mmask16      k0           // we need the compiler to assume this
+                              // might not be -1 but in fact it needs to be
 ) {
   // constants
-  constexpr std::size_t vector_size = sizeof(__m512i);
+  constexpr std::size_t m512i_size = sizeof(__m512i);
 
   // loop invariants
-  auto c_z = _mm512_set1_epi32(count_zero);  // broadcast the amountof zeros
+  auto cX_z = _mm512_set1_epi32(count_zero);  // broadcast the amount of zeros
 
-  // adjustments
-  cache_step *= sizeof(*queue_iter);  // adjust for _addr()
+  // software pipelining preload
+  auto cX_j_pipe = _mm512_load_si512(queue_iter   );
+  auto offsets   = _mm512_srli_epi32(cX_j_pipe , 5);
+  auto bits_pipe = _mm512_i64gather_epi64(offsets, rdict_base + 0, 8);
+  auto rank_pipe = _mm512_i64gather_epi64(offsets, rdict_base + 1, 8);
 
-  while (queue_iter < queue_last) {
+  // this is based on
+  //   Computing the longest common prefix array based on the Burrows–Wheeler transform - Uwe Baier
+  //     this describes the iteration over the BWT in order to do
+  //     a breath-first search on the (virtual) suffix tree
+  //   Lossless data compression via substring enumeration - D Dube
+  //     this describes the actual compression algorithm
+  //     it basically recursively refines a markov model
+  //   Improving Compression via Substring Enumeration by Explicit Phase Awareness. - M Béliveau
+  //     this explains why the dictionary is actually done
+  //     on 8 dictionaries. This implementation uses a wavelet matrix
+  //     rather than a regular wavelet tree.
+
+  for (std::size_t i = 0; queue_iter < queue_last; ++i) {
     IACA_START
-    // load queue
-    auto c_j   = _mm512_load_si512(queue_iter);
-    auto c_i   = _mm512_load_si512(_addr(cache_iter, 0 * cache_step));
-    auto c_k   = _mm512_load_si512(_addr(cache_iter, 1 * cache_step));
-    queue_iter = _addr(queue_iter, vector_size);
+    // pipeline cX_j
+    auto cX_j  = cX_j_pipe;
+    cX_j_pipe  = _mm512_load_si512(queue_iter);
+    queue_iter = _addr(queue_iter, m512i_size);
 
-    // load ranks
-    auto r1_j  = _rank_get(rdict_base, c_j);
+    // load from cache (queue and ranks)
+    auto cX_i  = _mm512_load_si512(_addr(cache_iter, 0 * cache_step));
+    auto cX_k  = _mm512_load_si512(_addr(cache_iter, 1 * cache_step));
     auto r1_i  = _mm512_load_si512(_addr(cache_iter, 2 * cache_step));
     auto r1_k  = _mm512_load_si512(_addr(cache_iter, 4 * cache_step));
-    cache_iter = _addr(cache_iter, vector_size);
+
+    // start preload
+    offsets    = _mm512_srli_epi32(cX_j_pipe, 5);
+    auto bits  = bits_pipe;
+    bits_pipe  = _mm512_mask_i64gather_epi64(bits_pipe, k0, offsets, rdict_base + 0, 8);
+    auto rank  = rank_pipe;
+    rank_pipe  = _mm512_mask_i64gather_epi64(rank_pipe, k0, offsets, rdict_base + 1, 8);
+
+    // calculate the rank
+    auto r1_j  = _rank_get(bits, rank, cX_j);
 
     // calculate some butterflies vars
-    auto n_1w_ = _mm512_sub_epi32(c_k, c_j);
+    auto n_1w_ = _mm512_sub_epi32(cX_k, cX_j);
 
     // calculate the number of zeros before each point
-    auto r0_i = _mm512_sub_epi32(c_i, r1_i);
-    auto r0_j = _mm512_sub_epi32(c_j, r1_j);
-    auto r0_k = _mm512_sub_epi32(c_k, r1_k);
+    auto r0_i  = _mm512_sub_epi32(cX_i, r1_i);
+    auto r0_j  = _mm512_sub_epi32(cX_j, r1_j);
+    auto r0_k  = _mm512_sub_epi32(cX_k, r1_k);
 
     // calculate the rest of the butterfly vars
     auto n__w1 = _mm512_sub_epi32(r1_k, r1_i);
@@ -134,19 +139,19 @@ int encode_main (
     auto n_1w1 = _mm512_sub_epi32(r1_k, r1_j);
 
     __mmask16 select_mask;
-    // right out the queue (zero part)
-    select_mask = _mm512_cmpgt_epi32_mask(r0_j, r0_i);
-    select_mask = _mm512_mask_cmpgt_epi32_mask(select_mask, r0_k, r0_j);
-    _mm512_mask_compressstoreu_epi32(queue_out0, select_mask, _mm512_add_epi32(r0_j, c_z));
-    queue_out0 += _mm_popcnt_u64(select_mask);
-    *smask_out0++ = select_mask;
+    // write out the queue (zero part)
+    select_mask   = _mm512_cmpgt_epi32_mask(r0_j, r0_i);
+    select_mask   = _mm512_mask_cmpgt_epi32_mask(select_mask, r0_k, r0_j);
+    _mm512_mask_compressstoreu_epi32(queue_out0, select_mask, r0_j);
+    queue_out0   += _mm_popcnt_u64(select_mask);
+    *fmask_out0++ = select_mask;
 
-    // right out the queue (ones part)
-    select_mask = _mm512_cmpgt_epi32_mask(r1_j, r1_i);
-    select_mask = _mm512_mask_cmpgt_epi32_mask(select_mask, r1_k, r1_j);
-    _mm512_mask_compressstoreu_epi32(queue_out1, select_mask,  _mm512_add_epi32(r1_j, c_z));
-    queue_out1 += _mm_popcnt_u64(select_mask);
-    *smask_out1++ = select_mask;
+    // write out the queue (zero part)
+    select_mask   = _mm512_cmpgt_epi32_mask(r1_j, r1_i);
+    select_mask   = _mm512_mask_cmpgt_epi32_mask(select_mask, r1_k, r1_j);
+    _mm512_mask_compressstoreu_epi32(queue_out1, select_mask, r1_j);
+    queue_out1   += _mm_popcnt_u64(select_mask);
+    *fmask_out1++ = select_mask;
 
     // calculate the limits from the butterfly
     __m512i min = _mm512_maskz_sub_epi32(_mm512_cmpgt_epi32_mask(n_1w_, n__w0), n_1w_, n__w0);
@@ -157,28 +162,30 @@ int encode_main (
     auto base  = _mm512_add_epi32(_mm512_sub_epi32(max, min), _mm512_set1_epi32(1));
 
     // store the limits for the coder
-    _mm512_storeu_si512(_addr(coder_iter, 0 * vector_size), digit);
-    _mm512_storeu_si512(_addr(coder_iter, 1 * vector_size), base );
-    coder_iter = _addr(coder_iter, 2 * vector_size);
+    _mm512_storeu_si512(_addr(coder_iter, 0 * m512i_size), digit);
+    _mm512_storeu_si512(_addr(coder_iter, 1 * m512i_size), base );
+    coder_iter = _addr(coder_iter, 2 * m512i_size);
 
     // interleave loads and ranks
     // write out only the used ones (lo part)
-    auto mask_lo  = static_cast<std::uint16_t>(*smask_iter++);
-    //auto pmask_lo = _compress_mask(mask_lo);
-    _interleavelo_compress_and_store(_addr(cache_next, 0 * cache_step), mask_lo, c_i , c_j );
-    _interleavelo_compress_and_store(_addr(cache_next, 1 * cache_step), mask_lo, c_j , c_k );
-    _interleavelo_compress_and_store(_addr(cache_next, 2 * cache_step), mask_lo, r1_i, r1_j);
-    _interleavelo_compress_and_store(_addr(cache_next, 4 * cache_step), mask_lo, r1_j, r1_k);
-    cache_next += _mm_popcnt_u32(mask_lo);
+    auto mask_lo  = *fmask_iter++;
+    auto shuffle_masklo = _mm512_set_epi32(23, 7,22, 6,21, 5,20, 4,19, 3,18, 2,17, 1,16, 0);
+         shuffle_masklo = _mm512_maskz_compress_epi32(mask_lo, shuffle_masklo);
+    auto cache_next_tmp = cache_next + _mm_popcnt_u64(mask_lo);
+    _permute_and_store(_addr(cache_next, 0 * cache_step), shuffle_masklo, cX_i, cX_j);
+    _permute_and_store(_addr(cache_next, 1 * cache_step), shuffle_masklo, cX_j, cX_k);
+    _permute_and_store(_addr(cache_next, 2 * cache_step), shuffle_masklo, r1_i, r1_j);
+    _permute_and_store(_addr(cache_next, 4 * cache_step), shuffle_masklo, r1_j, r1_k);
 
     // write out only the used ones (hi part)
-    auto mask_hi  = static_cast<std::uint16_t>(*smask_iter++);
-    //auto pmask_hi = _compress_mask(mask_hi);
-    _interleavehi_compress_and_store(_addr(cache_next, 0 * cache_step), mask_hi, c_i , c_j );
-    _interleavehi_compress_and_store(_addr(cache_next, 1 * cache_step), mask_hi, c_j , c_k );
-    _interleavehi_compress_and_store(_addr(cache_next, 2 * cache_step), mask_hi, r1_i, r1_j);
-    _interleavehi_compress_and_store(_addr(cache_next, 4 * cache_step), mask_hi, r1_j, r1_k);
-    cache_next += _mm_popcnt_u32(mask_hi);
+    auto mask_hi  = *fmask_iter++;
+    auto shuffle_maskhi = _mm512_set_epi32(31,15,30,14,29,13,28,12,27,11,26,10,25, 9,24, 8);
+         shuffle_maskhi = _mm512_maskz_compress_epi32(mask_hi, shuffle_maskhi);
+    cache_next = cache_next_tmp + _mm_popcnt_u64(mask_hi);
+    _permute_and_store(_addr(cache_next_tmp, 0 * cache_step), shuffle_maskhi, cX_i, cX_j);
+    _permute_and_store(_addr(cache_next_tmp, 1 * cache_step), shuffle_maskhi, cX_j, cX_k);
+    _permute_and_store(_addr(cache_next_tmp, 2 * cache_step), shuffle_maskhi, r1_i, r1_j);
+    _permute_and_store(_addr(cache_next_tmp, 4 * cache_step), shuffle_maskhi, r1_j, r1_k);
   }
   IACA_END
   return 0;
