@@ -138,20 +138,20 @@ int encode_main (
     auto n__w0 = _mm512_sub_epi32(r0_k, r0_i);
     auto n_1w1 = _mm512_sub_epi32(r1_k, r1_j);
 
-    __mmask16 select_mask;
+    __mmask16 filter_mask;
     // write out the queue (zero part)
-    select_mask   = _mm512_cmpgt_epi32_mask(r0_j, r0_i);
-    select_mask   = _mm512_mask_cmpgt_epi32_mask(select_mask, r0_k, r0_j);
-    _mm512_mask_compressstoreu_epi32(queue_out0, select_mask, r0_j);
-    queue_out0   += _mm_popcnt_u64(select_mask);
-    *fmask_out0++ = select_mask;
+    filter_mask   = _mm512_cmpgt_epi32_mask(r0_j, r0_i);
+    filter_mask   = _mm512_mask_cmpgt_epi32_mask(filter_mask, r0_k, r0_j);
+    _mm512_mask_compressstoreu_epi32(queue_out0, filter_mask, r0_j);
+    queue_out0   += _mm_popcnt_u64(filter_mask);
+    *fmask_out0++ = filter_mask;
 
     // write out the queue (zero part)
-    select_mask   = _mm512_cmpgt_epi32_mask(r1_j, r1_i);
-    select_mask   = _mm512_mask_cmpgt_epi32_mask(select_mask, r1_k, r1_j);
-    _mm512_mask_compressstoreu_epi32(queue_out1, select_mask, r1_j);
-    queue_out1   += _mm_popcnt_u64(select_mask);
-    *fmask_out1++ = select_mask;
+    filter_mask   = _mm512_cmpgt_epi32_mask(r1_j, r1_i);
+    filter_mask   = _mm512_mask_cmpgt_epi32_mask(filter_mask, r1_k, r1_j);
+    _mm512_mask_compressstoreu_epi32(queue_out1, filter_mask, r1_j);
+    queue_out1   += _mm_popcnt_u64(filter_mask);
+    *fmask_out1++ = filter_mask;
 
     // calculate the limits from the butterfly
     __m512i min = _mm512_maskz_sub_epi32(_mm512_cmpgt_epi32_mask(n_1w_, n__w0), n_1w_, n__w0);
