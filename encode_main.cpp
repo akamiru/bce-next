@@ -38,13 +38,14 @@ inline __m512i _rank_get(__m512i bits, __m512i rank, __m512i indice) {
   return _mm512_add_epi32(rank, bits);
 }
 
-inline std::uint32_t* _addr(std::uint32_t* base, std::size_t byte_step) {
-  return reinterpret_cast<std::uint32_t*>(
+template<class T>
+inline T* _addr(T* base, std::size_t byte_step) {
+  return reinterpret_cast<T*>(
     reinterpret_cast<std::uint8_t*>(base) + byte_step
   );
 }
 
-int encode_main (
+void encode_main (
   // The queues
   //  current
   std::uint32_t* queue_iter,  // start of the queue
@@ -102,7 +103,7 @@ int encode_main (
   //     on 8 dictionaries. This implementation uses a wavelet matrix
   //     rather than a regular wavelet tree.
 
-  for (std::size_t i = 0; queue_iter < queue_last; ++i) {
+  while (queue_iter < queue_last) {
     IACA_START
     // pipeline cX_j
     auto cX_j  = cX_j_pipe;
@@ -188,7 +189,6 @@ int encode_main (
     _permute_and_store(_addr(cache_next_tmp, 4 * cache_step), shuffle_maskhi, r1_j, r1_k);
   }
   IACA_END
-  return 0;
 }
 
 int main() {}
