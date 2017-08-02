@@ -15,8 +15,8 @@ __m512 div22_by_lt32(__m512 a, __m512i b) {
   // vpermi2ps to destroy b
   auto rcp = _mm512_permutex2var_ps(t2, b, t1);
   // divide
-  auto c = _mm512_mul_round_ps(a, rcp, _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC);
-  return _mm512_roundscale_ps(c, 1);  // floor c
+  auto c = _mm512_fmadd_round_ps(a, rcp, _mm512_set1_ps(1<<23), _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC);
+  return _mm512_sub_ps(c, _mm512_set1_ps(1<<23));  // floor c
 }
 
 template<class T>
@@ -42,7 +42,8 @@ __m512i decode_ans(
 ) {
   // check if there are small codings
   auto small_mask = _mm512_cmpgt_epi32_mask(_mm512_set1_epi32(32), base_int32);
-  
+
+  __m512i digit_int32;
   if (!_mm512_kortestc(small_mask, small_mask)) {
     // @todo Add fallback for large bases
     _mm512_storeu_si512(reinterpret_cast<__m512i*>(stream_ptr), base_int32);  // just to keep the branch
@@ -55,7 +56,7 @@ __m512i decode_ans(
   auto state_sml1 = div22_by_lt32(state_sml0, base_int32);
   auto digit      = _mm512_fnmadd_ps(state_sml1, base_float, state_sml0);  // digit = s0 % b = s0 - s1 * b
 
-  // test for underflow
+  // test for underflow NOTE: we could compare to c in div22_by_lt32 in order to skip latency of the sub
   auto uflow_mask = _mm512_cmp_ps_mask(_mm512_set1_ps(small_smin), state_sml1, _CMP_GT_OQ);
 
   // load bytes
@@ -67,7 +68,7 @@ __m512i decode_ans(
   state_sml0 = _mm512_mask_fmadd_ps(state_sml1, uflow_mask, _mm512_set1_ps(256), stream_flt);
 
   // convert and return
-  return _mm512_cvtps_epi32(digit);
+  return _mm512_mask_cvtps_epi32(digit_int32, small_mask, digit);
 }
 
 void minimal_loop(__m512i* base, std::uint8_t*  stream_ptr) {
@@ -75,9 +76,9 @@ void minimal_loop(__m512i* base, std::uint8_t*  stream_ptr) {
   auto state_sml1 = _mm512_set1_ps(small_smin);  // actually loaded from stream_ptr
   auto state_sml2 = _mm512_set1_ps(small_smin);  // actually loaded from stream_ptr
 
-  for (__m512i* be = base + 1024; base < be;) {
+  for (__m512i* be = base + 1024; base < be; base++) {
     // IACA_START
-    decode_ans(state_sml0, *base++, stream_ptr);
+    *base = decode_ans(state_sml0, *base, stream_ptr);
 
     auto tmp   = state_sml0;
     state_sml0 = state_sml1;
