@@ -119,9 +119,9 @@ void encode_main (
     // start preload
     offsets    = _mm512_srli_epi32(cX_j_pipe, 5);
     auto bits  = bits_pipe;
-    bits_pipe  = _mm512_mask_i64gather_epi64(bits_pipe, k0, offsets, rdict_base + 0, 8);
+    bits_pipe  = _mm512_mask_i32gather_epi32(bits_pipe, k0, offsets, rdict_base + 0, 8);
     auto rank  = rank_pipe;
-    rank_pipe  = _mm512_mask_i64gather_epi64(rank_pipe, k0, offsets, rdict_base + 1, 8);
+    rank_pipe  = _mm512_mask_i32gather_epi32(rank_pipe, k0, offsets, rdict_base + 1, 8);
 
     // calculate the rank
     auto r1_j  = _rank_get(bits, rank, cX_j);
