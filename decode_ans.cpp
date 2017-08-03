@@ -62,7 +62,7 @@ constexpr std::size_t large_shft = 32;
 constexpr std::size_t small_smin = 1 << (small_bits - small_shft);
 constexpr std::size_t large_smin = 1 << (large_bits - large_shft);
 
-__m512i decode_ans(
+inline __m512i decode_ans(
   __m512&        state_sml0,  // current state, the rolling is done in the calling loop
   __m512i        base_int32,  // base to decode with
   std::uint8_t*& stream_ptr   // where to read bits
@@ -99,7 +99,7 @@ __m512i decode_ans(
   return _mm512_mask_cvtps_epi32(digit_int32, small_mask, digit);
 }
 
-__m512i decode_ans_div(
+inline __m512i decode_ans_div(
   __m512&        state_sml0,  // current state, the rolling is done in the calling loop
   __m512i        base_int32,  // base to decode with
   std::uint8_t*& stream_ptr   // where to read bits
@@ -136,7 +136,7 @@ __m512i decode_ans_div(
   return _mm512_mask_cvtps_epi32(digit_int32, small_mask, digit);
 }
 
-__m512i decode_ans_int(
+inline __m512i decode_ans_int(
   __m512i&       state_sml0,  // current state, the rolling is done in the calling loop
   __m512i        base_int32,  // base to decode with
   std::uint8_t*& stream_ptr   // where to read bits
@@ -194,15 +194,15 @@ void minimal_loop_int(__m512i* base, std::uint8_t*  stream_ptr) {
   auto state_sml2 = _mm512_set1_epi32(small_smin);  // actually loaded from stream_ptr
 
   for (__m512i* be = base + 1024; base < be; base++) {
-    IACA_START
+    // IACA_START
     *base = decode_ans_int(state_sml0, *base, stream_ptr);
 
     // auto tmp   = state_sml0;
-    //state_sml0 = state_sml1;
-    //state_sml1 = state_sml2;
-    //state_sml2 = tmp;
+    // state_sml0 = state_sml1;
+    // state_sml1 = state_sml2;
+    // state_sml2 = tmp;
   }
-  IACA_END
+  // IACA_END
 }
 
 int main() {}

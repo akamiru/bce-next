@@ -54,19 +54,37 @@ void decode_main (
 ) {
   // constants
   constexpr std::size_t m512i_size = sizeof(__m512i);
-  // the last element MAY be the same as the first because 16 contexts do fit within 32 bits
-  const     __m512i     permt_left = _mm512_set_epi32(14,13,12,11,10, 9, 8 , 7, 6, 5, 4, 3, 2, 1, 0, 0);
+  // const shuffle masks
+  const auto rotate_l1 = [](auto i) { return _mm512_permutexvar_epi32(
+    _mm512_set_epi32(14,13,12,11,10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0,15), i);
+  };
+  const auto rotate_l2 = [](auto i) { return _mm512_permutexvar_epi32(
+    _mm512_set_epi32(13,12,11,10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0,15,14), i);
+  };
+  const auto rotate_l4 = [](auto i) { return _mm512_permutexvar_epi32(
+    _mm512_set_epi32(11,10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0,15,14,13,12), i);
+  };
+  const auto rotate_l8 = [](auto i) { return _mm512_permutexvar_epi32(
+    _mm512_set_epi32( 7, 6, 5, 4, 3, 2, 1, 0,15,14,13,12,11,10, 9, 8), i);
+  };
 
   // loop invariants
   auto cX_z = _mm512_set1_epi32(count_zero);  // broadcast the amount of zeros
-  
+
   // init ANS decoder
   auto state_sml0 = _mm512_set1_epi32(0);  // actually loaded from stream_ptr
   auto state_sml1 = _mm512_set1_epi32(0);  // actually loaded from stream_ptr
   auto state_sml2 = _mm512_set1_epi32(0);  // actually loaded from stream_ptr
+  // auto state_sml0 = _mm512_set1_ps(0);  // actually loaded from stream_ptr
+  // auto state_sml1 = _mm512_set1_ps(0);  // actually loaded from stream_ptr
+  // auto state_sml2 = _mm512_set1_ps(0);  // actually loaded from stream_ptr
 
   // @todo software pipelining
-  
+  auto cX_j_pipe = _mm512_load_si512(queue_iter   );
+  auto offsets   = _mm512_srli_epi32(cX_j_pipe , 5);
+  auto bits_pipe = _mm512_i64gather_epi64(offsets, rdict_base + 0, 8);
+  auto rank_pipe = _mm512_i64gather_epi64(offsets, rdict_base + 1, 8);
+
   // this is based on
   //   Computing the longest common prefix array based on the Burrows–Wheeler transform - Uwe Baier
   //     this describes the iteration over the BWT in order to do
@@ -79,26 +97,28 @@ void decode_main (
   //     on 8 dictionaries. This implementation uses a wavelet matrix
   //     rather than a regular wavelet tree.
 
-  // decompressing is a lot more complex
-  // we aim for around 40-50 cycles here:
-  // 21 loads + 
+  // Sadly decompressing is a lot more complex
+  __m512i pa, pb, pc;
+  __mmask16 ma, mb;
   while (queue_iter < queue_last) {
-    //IACA_START
-    // cX_j
+    IACA_START
+    // pipeline cX_j
     auto cX_j  = _mm512_load_si512(queue_iter);
     queue_iter = _addr(queue_iter, m512i_size);
-    
+
     // gather the bits
     auto offsets = _mm512_srli_epi32(cX_j, 5);
     auto indice  = _mm512_and_epi32 (cX_j, _mm512_set1_epi32(0x1F));
     auto bits    = _mm512_i32gather_epi32(offsets, rdict_base + 0, 8);
+    auto rank  = rank_pipe;
+    rank_pipe  = _mm512_mask_i64gather_epi64(rank_pipe, k0, offsets, rdict_base + 1, 8);
 
     // load from cache (queue and ranks)
     auto cX_i  = _mm512_load_si512(_addr(cache_iter, 0 * cache_step));
     auto cX_k  = _mm512_load_si512(_addr(cache_iter, 1 * cache_step));
     auto r1_i  = _mm512_load_si512(_addr(cache_iter, 2 * cache_step));
     auto r1_k  = _mm512_load_si512(_addr(cache_iter, 4 * cache_step));
-    
+
     // calculate some butterflies vars
     auto n_1w_ = _mm512_sub_epi32(cX_k, cX_j);
 
@@ -116,59 +136,74 @@ void decode_main (
 
     // calculate the digit and the base
     auto base  = _mm512_add_epi32(_mm512_sub_epi32(max, min), _mm512_set1_epi32(1));
-    auto digit =  decode_ans_int (state_sml0, base, stream_ptr);
-    
+    auto digit =  decode_ans_int     (state_sml0, base, stream_ptr);
+    auto tmp   = state_sml0;
+    state_sml0 = state_sml1;
+    state_sml1 = state_sml2;
+    state_sml2 = tmp;
+
     // calculate the rest of the butterfly vars
     auto n_1w1 = _mm512_add_epi32(min  , digit);
     auto n_0w1 = _mm512_sub_epi32(n__w1, n_1w1);
     auto n_1w0 = _mm512_sub_epi32(n_1w_, n_1w1);
-    
+
     // calculate r0_j and r1_j
     auto r1_j  = _mm512_sub_epi32(r1_k, n_1w1);
     auto r0_j  = _mm512_sub_epi32(cX_j, r1_j );
-      
+
     // calculate set and clear maks
     // @todo validate this. It assumes full 32 bit unsigned shift indices
     //       according to Intels Intrinsic Guide thats correct
-    auto index_mask = _mm512_sllv_epi32(_mm512_set1_epi32(1), indice);
-    auto clear_mask = _mm512_sllv_epi32(_mm512_set1_epi32(1), _mm512_add_epi32(indice, n_0w1));
-    auto set___mask = _mm512_sllv_epi32(_mm512_set1_epi32(1), _mm512_sub_epi32(indice, n_1w0));
-    clear_mask = _mm512_sub_epi32(clear_mask, index_mask);
-    set___mask = _mm512_sub_epi32(index_mask, set___mask);
-    // @todo if it turns out that there are a lot of conflicts
-    //       then we could theoretically merge the clear and set masks in log
-    //       time and apply them only once.
-    //       Even simple linear time merging will proably pays off by
-    //       avoiding multiple scatters.
-    
-    
-    // update the rank dictionary
-    __mmask16 mask = k0;
-    while (1) {
-      // conflict detection is too slow on skylake-avx512
-      auto conf_free = _mm512_mask_cmp_epi32_mask  (_mm512_kand(mask,0xFFFE), offsets, _mm512_permutevar_epi32(permt_left, offsets), 4/*_MM_CMPINT_NEQ*/);
-      auto rank_mask = _mm512_mask_cmpeq_epi32_mask(conf_free               , offsets, _mm512_srli_epi32(cX_i, 5));
-      
-      // clear and set the bits
-      bits = _mm512_andnot_si512(clear_mask, bits);  // bits &= ~clear_mask
-      bits = _mm512_or_si512    (set___mask, bits);  // bits |=  set___mask
-      
-      // calcualte the ranks
-      auto prev_bits = _mm512_min_epi32(indice, n_1w0  );  // part of n_1w0 that actually is within this chunk
-      auto rank      = _mm512_sub_epi32(r1_j, prev_bits);  // one those decrease the rank
-      
-      // scatter updates for bits and rank
-      _mm512_mask_i32scatter_epi32 (rdict_base + 0, conf_free, offsets, bits, 8);
-      _mm512_mask_i32scatter_epi32 (rdict_base + 1, rank_mask, offsets, rank, 8);
-      
-      mask = _mm512_kandn(conf_free, mask);  // drop the updated / conflict free elements
-      if (_mm512_kortestz(mask, mask)) // we're done
-        break;
-      
-      // regather bits by rotating the updated values to the right
-      bits = _mm512_permutevar_epi32(permt_left, bits);
-    }
-    
+    auto indx_mask = _mm512_sllv_epi32(_mm512_set1_epi32(1), indice);
+    auto drop_mask = _mm512_sllv_epi32(_mm512_set1_epi32(1), _mm512_add_epi32(indice, n_0w1));
+    auto set__mask = _mm512_sllv_epi32(_mm512_set1_epi32(1), _mm512_sub_epi32(indice, n_1w0));
+    drop_mask = _mm512_sub_epi32(drop_mask, indx_mask);
+    set__mask = _mm512_sub_epi32(indx_mask, set__mask);
+
+    // detect conflicts
+    auto conflicts_r = _mm512_mask_cmp_epi32_mask  (0xFFFE     , offsets, rotate_l1(offsets),      4);
+    auto no_conflict = ~(conflicts_r >> 1);
+    auto rank_mask   = _mm512_mask_cmpeq_epi32_mask(no_conflict, offsets, _mm512_srli_epi32(cX_i, 5));
+
+    // resolve conflicts
+    drop_mask = _mm512_mask_or_epi32(drop_mask, conflicts_r, drop_mask, rotate_l1(drop_mask));
+    set__mask = _mm512_mask_or_epi32(set__mask, conflicts_r, set__mask, rotate_l1(set__mask));
+    conflicts_r &= conflicts_r << 1;
+    drop_mask = _mm512_mask_or_epi32(drop_mask, conflicts_r, drop_mask, rotate_l2(drop_mask));
+    set__mask = _mm512_mask_or_epi32(set__mask, conflicts_r, set__mask, rotate_l2(set__mask));
+    conflicts_r &= conflicts_r << 2;
+    drop_mask = _mm512_mask_or_epi32(drop_mask, conflicts_r, drop_mask, rotate_l4(drop_mask));
+    set__mask = _mm512_mask_or_epi32(set__mask, conflicts_r, set__mask, rotate_l4(set__mask));
+    conflicts_r &= conflicts_r << 4;
+    drop_mask = _mm512_mask_or_epi32(drop_mask, conflicts_r, drop_mask, rotate_l8(drop_mask));
+    set__mask = _mm512_mask_or_epi32(set__mask, conflicts_r, set__mask, rotate_l8(set__mask));
+
+    // apply masks - truth table:
+    // a | 1 1 1 1 0 0 0 0 - input
+    // b | 1 1 0 0 1 1 0 0 - drop
+    // c | 1 0 1 0 1 0 1 0 - set
+    // --|-------------------------
+    // d | 1 0 1 1 0 0 1 0 - result
+    bits = _mm512_ternarylogic_epi32(bits, drop_mask, set__mask, 0xB2);
+
+    // calcualte the ranks
+    auto prev_bits = _mm512_min_epi32(indice, n_1w0  );  // part of n_1w0 that actually is within this chunk
+    rank = _mm512_mask_sub_epi32(rank, rank_mask, r1_j, prev_bits);  // the ones which actually decrease the rank
+
+    // scatter updates for bits and rank
+#if 0
+    _mm512_mask_i32scatter_epi32(rdict_base + 1, rank_mask  , offsets, rank, 8);
+    _mm512_mask_i32scatter_epi32(rdict_base + 0, no_conflict, offsets, bits, 8);
+#else
+    _mm512_mask_i64scatter_epi64(rdict_base + 1, ma, pa, pb, 8);
+    _mm512_mask_i32scatter_epi32(rdict_base + 0, mb, pa, pc, 8);
+    pa = offsets;
+    pb = rank;
+    pc = bits;
+    ma = rank_mask;
+    mb = no_conflict;
+#endif
+
     __mmask16 filter_mask;
     // write out the queue (zero part)
     filter_mask   = _mm512_cmpgt_epi32_mask(r0_j, r0_i);
@@ -205,7 +240,7 @@ void decode_main (
     _permute_and_store(_addr(cache_next_tmp, 2 * cache_step), shuffle_maskhi, r1_i, r1_j);
     _permute_and_store(_addr(cache_next_tmp, 4 * cache_step), shuffle_maskhi, r1_j, r1_k);
   }
-  //IACA_END
+  IACA_END
 }
 
 #if 0
