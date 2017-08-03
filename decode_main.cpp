@@ -54,8 +54,8 @@ void decode_main (
 ) {
   // constants
   constexpr std::size_t m512i_size = sizeof(__m512i);
-  // the last element MUST be bigger than the first because 16 contexts don't fit within 32 bits
-  const     __m512i     permt_left = _mm512_set_epi32(14,13,12,11,10, 9, 8 , 7, 6, 5, 4, 3, 2, 1, 0,15);
+  // the last element MAY be the same as the first because 16 contexts do fit within 32 bits
+  const     __m512i     permt_left = _mm512_set_epi32(14,13,12,11,10, 9, 8 , 7, 6, 5, 4, 3, 2, 1, 0, 0);
 
   // loop invariants
   auto cX_z = _mm512_set1_epi32(count_zero);  // broadcast the amount of zeros
@@ -146,8 +146,8 @@ void decode_main (
     __mmask16 mask = k0;
     while (1) {
       // conflict detection is too slow on skylake-avx512
-      auto conf_free = _mm512_mask_cmp_epi32_mask  (mask     , offsets, _mm512_permutevar_epi32(permt_left, offsets), 4/*_MM_CMPINT_NEQ*/);
-      auto rank_mask = _mm512_mask_cmpeq_epi32_mask(conf_free, offsets, _mm512_srli_epi32(cX_i, 5));
+      auto conf_free = _mm512_mask_cmp_epi32_mask  (_mm512_kand(mask,0xFFFE), offsets, _mm512_permutevar_epi32(permt_left, offsets), 4/*_MM_CMPINT_NEQ*/);
+      auto rank_mask = _mm512_mask_cmpeq_epi32_mask(conf_free               , offsets, _mm512_srli_epi32(cX_i, 5));
       
       // clear and set the bits
       bits = _mm512_andnot_si512(clear_mask, bits);  // bits &= ~clear_mask
