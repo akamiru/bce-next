@@ -46,6 +46,7 @@ std::uint8_t* encode_ans(
 
   // we write from a high adress to a low so we need to
   __m128i stream_buf;
+#if 0
   __m128i shuffle_mk[] = {
     // shuffle masks that move each element left by 1 and clear the low bytes
     _mm_set_epi8(0x0F,0x0E,0x0D,0x0C,0x0B,0x0A,0x09,0x08,0x07,0x06,0x05,0x04,0x03,0x02,0x01,0x00),
@@ -66,6 +67,9 @@ std::uint8_t* encode_ans(
     _mm_set_epi8(0x00,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF),
     _mm_set_epi8(0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF)
   };
+#else
+  __m128i shuffle_mk = _mm_set_epi8(0x0F,0x0E,0x0D,0x0C,0x0B,0x0A,0x09,0x08,0x07,0x06,0x05,0x04,0x03,0x02,0x01,0x00);
+#endif
 
   while (coder_iter < coder_last) {
     IACA_START
@@ -83,8 +87,13 @@ std::uint8_t* encode_ans(
 
     // shift out
     auto state_shft = _mm512_cvtepi32_epi8(_mm512_maskz_compress_epi32(oflow_mask, state_sml0));
+#if 1
     auto oflow_n    = _mm_popcnt_u64(oflow_mask);
+    auto oflow_bc   = _mm_broadcastb_epi8(_mm_cvtsi128_si64x(oflow_n));
+    stream_buf      = _mm_shuffle_epi8(stream_buf, _mm_sub_si128(shuffle_mk, oflow_bc));
+#else
     stream_buf      = _mm_shuffle_epi8(stream_buf, _mm_load_si128(shuffle_mk + oflow_n));
+#endif
     stream_buf      = _mm_or_si128(stream_buf, state_shft);  // @todo if vpermi2b has a low latency then this might be improved
     stream_out     -= oflow_n;
     _mm_storeu_si128(reinterpret_cast<__m128i*>(stream_out), stream_buf);  // partially overrides
