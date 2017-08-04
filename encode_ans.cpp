@@ -88,8 +88,7 @@ std::uint8_t* encode_ans(
     // shift out
     auto state_shft = _mm512_cvtepi32_epi8(_mm512_maskz_compress_epi32(oflow_mask, state_sml0));
 #if 1
-    auto oflow_n    = _mm_popcnt_u64(oflow_mask);
-    auto oflow_bc   = _mm_broadcastb_epi8(_mm_cvtsi128_si64x(oflow_n));
+    auto oflow_bc   = _mm_set1_epi8 (_mm_popcnt_u64(oflow_mask));
     stream_buf      = _mm_shuffle_epi8(stream_buf, _mm_sub_si128(shuffle_mk, oflow_bc));
 #else
     stream_buf      = _mm_shuffle_epi8(stream_buf, _mm_load_si128(shuffle_mk + oflow_n));
