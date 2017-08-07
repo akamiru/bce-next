@@ -46,7 +46,7 @@ std::uint8_t* encode_ans(
 
   // we write from a high adress to a low so we need to
   __m128i stream_buf;
-#if 0
+#if 1
   __m128i shuffle_mk[] = {
     // shuffle masks that move each element left by 1 and clear the low bytes
     _mm_set_epi8(0x0F,0x0E,0x0D,0x0C,0x0B,0x0A,0x09,0x08,0x07,0x06,0x05,0x04,0x03,0x02,0x01,0x00),
@@ -87,9 +87,11 @@ std::uint8_t* encode_ans(
 
     // shift out
     auto state_shft = _mm512_cvtepi32_epi8(_mm512_maskz_compress_epi32(oflow_mask, state_sml0));
-#if 1
-    auto oflow_bc   = _mm_set1_epi8 (_mm_popcnt_u64(oflow_mask));
-    stream_buf      = _mm_shuffle_epi8(stream_buf, _mm_sub_si128(shuffle_mk, oflow_bc));
+    auto oflow_n    = _mm_popcnt_u64(oflow_mask);
+#if 0
+    // auto oflow_bc   = _mm_set1_epi8 (oflow_n);
+    auto oflow_bc   = _mm_broadcastb_epi8 (_mm_cvtsi32_si128(oflow_n));
+    stream_buf      = _mm_shuffle_epi8(stream_buf, _mm_sub_epi32(shuffle_mk, oflow_bc));
 #else
     stream_buf      = _mm_shuffle_epi8(stream_buf, _mm_load_si128(shuffle_mk + oflow_n));
 #endif

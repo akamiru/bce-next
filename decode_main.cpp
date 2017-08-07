@@ -59,7 +59,7 @@ void decode_main (
   // const __m512i select_rank = _mm512_set_epi32(31,29,27,25,23,21,19,17,15,13,11, 9, 7, 5, 3, 1);  // hi address
   const __m512i merge_lo = _mm512_set_epi32(23, 7,22, 6,21, 5,20, 4,19, 3,18, 2,17, 1,16, 0);  // lo address inverse
   const __m512i merge_hi = _mm512_set_epi32(31,15,30,14,29,13,28,12,27,11,26,10,25, 9,24, 8);  // hi address inverse
-  
+
   // lambdas
   const auto rotate_l1 = [](auto i, auto j) { return _mm512_alignr_epi32(i, j, 15); };
   const auto rotate_l2 = [](auto i, auto j) { return _mm512_alignr_epi32(i, j, 14); };
@@ -77,7 +77,7 @@ void decode_main (
   // bypassing
   auto offset_bp = _mm512_set1_epi32(0);
   auto flip_bpmk = _mm512_set1_epi32(0);
-  
+
   // pipeline
   auto flip_mask_pipe = _mm512_set1_epi32(0);
   auto bits_pipe      = _mm512_set1_epi32(0);
@@ -114,7 +114,6 @@ void decode_main (
     auto offsets = _mm512_srli_epi32(cX_j, 5);
     auto indice  = _mm512_and_epi32 (cX_j, _mm512_set1_epi32(0x1F));
     auto bits    = _mm512_i32gather_epi32(offsets, _addr(rdict_base, 0), 8);
-    auto rank    = _mm512_i32gather_epi32(offsets, _addr(rdict_base, 4), 8);
 
     // calculate some butterflies vars
     auto n_1w_ = _mm512_sub_epi32(cX_k, cX_j);
@@ -140,6 +139,9 @@ void decode_main (
     state_sml1 = state_sml2;
     state_sml2 = tmp;
 
+    // gather the ranks
+    auto rank  = _mm512_i32gather_epi32(offsets, _addr(rdict_base, 4), 8);
+
     // calculate the rest of the butterfly vars
     auto n_1w1 = _mm512_mask_add_epi32(digit, min_mask, digit, min);
     auto n_0w1 = _mm512_sub_epi32(n__w1, n_1w1);
@@ -149,20 +151,14 @@ void decode_main (
     auto r1_j  = _mm512_sub_epi32(r1_k, n_1w1);
     auto r0_j  = _mm512_sub_epi32(cX_j, r1_j );
 
-    __mmask16 filter_mask;    
-    // write out the queue (zero part)
-    filter_mask   = _mm512_cmpgt_epi32_mask(r0_j, r0_i);
-    filter_mask   = _mm512_mask_cmpgt_epi32_mask(filter_mask, r0_k, r0_j);
-    _mm512_mask_compressstoreu_epi32(queue_out0, filter_mask, r0_j);
-    queue_out0   += _mm_popcnt_u64(filter_mask);
-    *fmask_out0++ = filter_mask;
-    
-    // write out the queue (ones part)
-    filter_mask   = _mm512_cmpgt_epi32_mask(r1_j, r1_i);
-    filter_mask   = _mm512_mask_cmpgt_epi32_mask(filter_mask, r1_k, r1_j);
-    _mm512_mask_compressstoreu_epi32(queue_out1, filter_mask, _mm512_add_epi32(cX_z, r1_j));
-    queue_out1   += _mm_popcnt_u64(filter_mask);
-    *fmask_out1++ = filter_mask;
+    // calculate set and clear masks
+    // @todo validate this. It assumes full 32 bit unsigned shift indices
+    //       according to Intels Intrinsic Guide that's correct
+    auto indx_mask = _mm512_sllv_epi32(_mm512_set1_epi32(1), indice);
+    auto drop_mask = _mm512_sllv_epi32(_mm512_set1_epi32(1), _mm512_add_epi32(indice, n_0w1));
+    auto set__mask = _mm512_sllv_epi32(_mm512_set1_epi32(1), _mm512_sub_epi32(indice, n_1w0));
+         drop_mask = _mm512_sub_epi32(drop_mask, indx_mask);
+         set__mask = _mm512_sub_epi32(indx_mask, set__mask);
 
     // interleave loads and ranks
     // write out only the used ones (lo part)
@@ -182,16 +178,22 @@ void decode_main (
     _permute_and_store(_addr(cache_next_tmp, 1 * cache_step), shuffle_maskhi, cX_j, cX_k);
     _permute_and_store(_addr(cache_next_tmp, 2 * cache_step), shuffle_maskhi, r1_i, r1_j);
     _permute_and_store(_addr(cache_next_tmp, 4 * cache_step), shuffle_maskhi, r1_j, r1_k);
-    
-    // calculate set and clear masks
-    // @todo validate this. It assumes full 32 bit unsigned shift indices
-    //       according to Intels Intrinsic Guide that's correct
-    auto indx_mask = _mm512_sllv_epi32(_mm512_set1_epi32(1), indice);
-    auto drop_mask = _mm512_sllv_epi32(_mm512_set1_epi32(1), _mm512_add_epi32(indice, n_0w1));
-    auto set__mask = _mm512_sllv_epi32(_mm512_set1_epi32(1), _mm512_sub_epi32(indice, n_1w0));
-         drop_mask = _mm512_sub_epi32(drop_mask, indx_mask);
-         set__mask = _mm512_sub_epi32(indx_mask, set__mask);
-    
+
+    __mmask16 filter_mask;
+    // write out the queue (zero part)
+    filter_mask   = _mm512_cmpgt_epi32_mask(r0_j, r0_i);
+    filter_mask   = _mm512_mask_cmpgt_epi32_mask(filter_mask, r0_k, r0_j);
+    _mm512_mask_compressstoreu_epi32(queue_out0, filter_mask, r0_j);
+    queue_out0   += _mm_popcnt_u64(filter_mask);
+    *fmask_out0++ = filter_mask;
+
+    // write out the queue (ones part)
+    filter_mask   = _mm512_cmpgt_epi32_mask(r1_j, r1_i);
+    filter_mask   = _mm512_mask_cmpgt_epi32_mask(filter_mask, r1_k, r1_j);
+    _mm512_mask_compressstoreu_epi32(queue_out1, filter_mask, _mm512_add_epi32(cX_z, r1_j));
+    queue_out1   += _mm_popcnt_u64(filter_mask);
+    *fmask_out1++ = filter_mask;
+
     // combine masks - truth table:
     // input  | 1 1 1 1 0 0 0 0
     // drop   | 1 1 0 0 1 1 0 0
@@ -208,10 +210,10 @@ void decode_main (
 
     // pipeline:
     // zmm: indice, bits, rank, offsets, cX_i
-    std::swap(flip_mask_pipe , flip_mask);
-    std::swap(bits_pipe      , bits     );
-    std::swap(rank_pipe      , rank     );
-    std::swap(offsets_pipe   , offsets  );
+    // std::swap(flip_mask_pipe , flip_mask);
+    // std::swap(bits_pipe      , bits     );
+    // std::swap(rank_pipe      , rank     );
+    // std::swap(offsets_pipe   , offsets  );
 
     // conflict masks
     auto conflicts_r = _mm512_cmp_epi32_mask(offsets, rotate_l1(offsets, offset_bp), 4);
@@ -229,7 +231,7 @@ void decode_main (
 
     // apply flip masks
     bits = _mm512_xor_epi32(bits, flip_mask);
-      
+
     // scatter updates for bits and rank
     auto bits_lo = _mm512_permutex2var_epi32(bits, merge_lo, rank);
     auto bits_hi = _mm512_permutex2var_epi32(bits, merge_hi, rank);

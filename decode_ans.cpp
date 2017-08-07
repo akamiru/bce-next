@@ -142,7 +142,7 @@ inline __m512i decode_ans_int(
   std::uint8_t*& stream_ptr   // where to read bits
 ) {
   // check if there are small codings
-  auto small_mask = _mm512_cmpgt_epi32_mask(_mm512_set1_epi32(32), base_int32);
+  auto small_mask = _mm512_cmp_epi32_mask(_mm512_set1_epi32(31), base_int32, 2);
 
   __m512i digit_int32;
   if (!_mm512_kortestc(small_mask, small_mask)) {
