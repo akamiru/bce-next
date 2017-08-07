@@ -150,7 +150,7 @@ void encode_main (
     // write out the queue (zero part)
     filter_mask   = _mm512_cmpgt_epi32_mask(r1_j, r1_i);
     filter_mask   = _mm512_mask_cmpgt_epi32_mask(filter_mask, r1_k, r1_j);
-    _mm512_mask_compressstoreu_epi32(queue_out1, filter_mask, r1_j);
+    _mm512_mask_compressstoreu_epi32(queue_out1, filter_mask, _mm512_add_epi32(cX_z, r1_j));
     queue_out1   += _mm_popcnt_u64(filter_mask);
     *fmask_out1++ = filter_mask;
 
