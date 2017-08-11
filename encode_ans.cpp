@@ -29,6 +29,26 @@ inline T* _addr(T* base, std::size_t byte_step) {
   );
 }
 
+inline std::uint8_t* encode_ans_big(std::uint8_t* stream_out, __mmask8 mask, __m512i& state, __m512i digit, __m512i base) {
+  // overflow test
+  auto oflow_test = _mm512_madd52hi_epu64(state, base, _mm512_set1_epi64(0));
+  auto oflow_mask = _mm512_mask_cmpgt_epi64_mask(mask, oflow_test, _mm512_set1_epi64(0));
+  auto oflow_n    = _mm_popcnt_u64(oflow_mask);
+
+  // shift out
+  auto state_shft = _mm512_cvtepi64_epi32(state);
+  stream_out      = _addr(stream_out, -oflow_n * sizeof(uint32_t));
+  _mm256_mask_compressstoreu_epi32(stream_out, oflow_mask, state_shft);
+
+  // rescale
+  state = _mm512_mask_srli_epi64(state, oflow_mask, state, large_shft);
+
+  // actual encoding
+  state = _mm512_mask_madd52lo_epu64(state, mask, base, digit);
+
+  return stream_out;
+}
+
 std::uint8_t* encode_ans(
   std::uint32_t* coder_iter,  // where the stream starts
   std::uint32_t* coder_last,  // where the stream ends
@@ -39,10 +59,8 @@ std::uint8_t* encode_ans(
   auto state_sml0 = _mm512_set1_epi32(small_smin);
   auto state_sml1 = _mm512_set1_epi32(small_smin);
   auto state_sml2 = _mm512_set1_epi32(small_smin);
-  // large states, 3 for pipelining (might not be worth it)
-  //auto state_lrg0 = _mm512_set1_epi64(large_smin);
-  //auto state_lrg1 = _mm512_set1_epi64(large_smin);
-  //auto state_lrg2 = _mm512_set1_epi64(large_smin);
+  // large states, no pipelining
+  auto state_lrg0 = _mm512_set1_epi64(large_smin);
 
   // we write from a high adress to a low so we need to
   __m128i stream_buf;
@@ -113,8 +131,15 @@ std::uint8_t* encode_ans(
     state_sml2 = tmp;
 
     if (!_mm512_kortestc(small_mask, small_mask)) {
-      // @todo Add fallback for large bases
-      _mm512_storeu_si512(reinterpret_cast<__m512i*>(stream_out), tmp);  // just to keep the branch
+      // compress lower half
+      auto digit_0 = _mm512_cvtepi32_epi64(_mm512_castsi512_si256(digit));
+      auto base_0  = _mm512_cvtepi32_epi64(_mm512_castsi512_si256(base  ));
+      stream_out   = encode_ans_big(stream_out, ~small_mask >> 0, state_lrg0, digit_0, base_0);
+      
+      // compress upper half
+      auto digit_1 = _mm512_cvtepi32_epi64(_mm512_extracti32x8_epi32(digit, 1));
+      auto base_1  = _mm512_cvtepi32_epi64(_mm512_extracti32x8_epi32(base  , 1));
+      stream_out   = encode_ans_big(stream_out, ~small_mask >> 8, state_lrg0, digit_1, base_1);
     }
   }
   IACA_END
@@ -125,11 +150,9 @@ std::uint8_t* encode_ans(
   _mm512_storeu_si512(_addr(stream_out, 2 * m512i_size), state_sml2);
   stream_out = _addr(stream_out, 3 * m512i_size);
 
-  // store large states
-  //_mm512_storeu_si512(_addr(stream_out, 0 * m512i_size), state_lrg0);
-  //_mm512_storeu_si512(_addr(stream_out, 1 * m512i_size), state_lrg1);
-  //_mm512_storeu_si512(_addr(stream_out, 2 * m512i_size), state_lrg2);
-  //stream_out = _addr(stream_out, 3 * m512i_size);
+  // store large state
+  _mm512_storeu_si512(_addr(stream_out, 0 * m512i_size), state_lrg0);
+  stream_out = _addr(stream_out, 1 * m512i_size);
 
   // return a pointer to the end
   return stream_out;
