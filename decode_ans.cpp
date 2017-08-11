@@ -136,6 +136,34 @@ inline __m512i decode_ans_div(
   return _mm512_mask_cvtps_epi32(digit_int32, small_mask, digit);
 }
 
+inline __m256i decode_ans_big(
+  __m512d&       state_lrg0,  // current state, the rolling is done in the calling loop
+  __mmask8       mask,
+  __m256i        base_int32,  // base to decode with
+  std::uint8_t*& stream_ptr   // where to read bits
+) {
+  // convert to float (should this use the mask?)
+  auto base_float = _mm512_cvtepi32_pd(base_int32);
+
+  // decode the symbol
+  auto state_lrg1 = _mm512_roundscale_pd(_mm512_div_pd(state_lrg0, base_float), 1);
+  auto digit      = _mm512_fnmadd_pd(state_lrg1, base_float, state_lrg0);  // digit = s0 % b = s0 - s1 * b
+
+  // test for underflow
+  auto uflow_mask = _mm512_mask_cmp_pd_mask(mask, _mm512_set1_pd(small_smin), state_lrg1, _CMP_GT_OQ);
+
+  // load bytes
+  auto stream_int = _mm256_maskz_expandloadu_epi32(uflow_mask, stream_ptr);
+  auto stream_flt = _mm512_cvtepi32_pd(stream_int);
+  stream_ptr      = _addr(stream_ptr, _mm_popcnt_u64(uflow_mask) * sizeof(uint32_t));
+
+  // rescale and update state
+  state_lrg0 = _mm512_mask_fmadd_pd(state_lrg1, uflow_mask, _mm512_set1_pd(UINT64_C(1) << large_shft), stream_flt);
+
+  // convert and return
+  return _mm512_cvtpd_epi32(digit);
+}
+
 inline __m512i decode_ans_int(
   __m512i&       state_sml0,  // current state, the rolling is done in the calling loop
   __m512i        base_int32,  // base to decode with
@@ -146,8 +174,12 @@ inline __m512i decode_ans_int(
 
   __m512i digit_int32;
   if (!_mm512_kortestc(small_mask, small_mask)) {
-    // @todo Add fallback for large bases
-    _mm512_storeu_si512(reinterpret_cast<__m512i*>(stream_ptr), base_int32);  // just to keep the branch
+    // @todo change parameter layout and code this correctly
+    // decode hi
+    //decode_ans_big();
+    
+    // decode lo
+    //decode_ans_big();
   }
 
   // decode the symbol
@@ -155,7 +187,7 @@ inline __m512i decode_ans_int(
   auto digit      = _mm512_sub_epi32(state_sml0, _mm512_mullo_epi32(state_sml1, base_int32));  // digit = s0 % b = s0 - s1 * b
 
   // test for underflow NOTE: we could compare to c in div22_by_lt32 in order to skip latency of the sub
-  auto uflow_mask = _mm512_cmpgt_epi32_mask(_mm512_set1_epi32(small_smin), state_sml1);
+  auto uflow_mask = _mm512_mask_cmpgt_epi32_mask(small_mask, _mm512_set1_epi32(small_smin), state_sml1);
 
   // load bytes
   auto stream_in  = _mm_loadu_si128(reinterpret_cast<__m128i*>(stream_ptr));
